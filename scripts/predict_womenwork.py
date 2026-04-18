@@ -1,0 +1,384 @@
+"""
+Batch script: womenwork tahmini
+- Model: gpt-5.4-mini, temperature: 0.8
+- Veri: personas_rewritten_v2.json (womenwork olan tüm personalar, ~2588)
+- Prompt temizleme: womenwork'ü sızdıran cinsiyet rolü cümleleri kaldırılır
+- Çıktı: exports/womenwork_predictions_<timestamp>.csv + .json
+- Kaldığı yerden devam (checkpoint) destekli, paralel istek
+"""
+
+import json
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from pathlib import Path
+
+from openai import OpenAI
+from tqdm import tqdm
+
+# ─── Sabitler ────────────────────────────────────────────────────────────────
+
+MODEL       = "gpt-5.4-mini"
+TEMPERATURE = 0.8
+MAX_TOKENS  = 80
+RETRY_LIMIT = 3
+RETRY_DELAY = 5
+MAX_WORKERS = 10
+
+BASE_DIR      = Path(__file__).parent.parent
+PERSONAS_PATH = BASE_DIR / "personas_rewritten_v2.json"
+EXPORTS_DIR   = BASE_DIR / "exports"
+EXPORTS_DIR.mkdir(exist_ok=True)
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+TURKEY_CONTEXT = (
+    "Türkiye'nin ideolojik yapısı iki temel eksen üzerinde şekillenir: sol-sağ siyasi ekseni ve "
+    "seküler-dindar kültürel ekseni. Sol tarafta sosyalizm, feminizm, sosyal demokrasi ve Kürt ulusal "
+    "hareketi birbirine yakın konumlanır. Sağ tarafta Türk milliyetçiliği ve Kemalizm yer alır. "
+    "Muhafazakârlık ve İslamcılık kültürel eksenin dindar ucunu oluşturur. "
+    "Türkiye'de cinsiyet rolleri, kadının iş hayatındaki yeri ve aile yapısı hem geleneksel hem de "
+    "modern değerlerin çatışma alanı olmaya devam etmektedir. Bireylerin bu konudaki tutumları; "
+    "dini kimlik, eğitim düzeyi, yaşanılan bölge ve siyasi eğilimle yakından ilişkilidir."
+)
+
+QUESTION = (
+    "Aşağıdaki soru kadınların çalışma hayatına ilişkin bir tutum sorusudur. "
+    "Kendi gerçek değerlerine ve bakış açına göre dürüstçe yanıtla.\n\n"
+    "Yanıtını SADECE şu JSON formatında ver, başka hiçbir şey yazma:\n"
+    '{"womenwork": <1, 2, 3, 4 veya 5>}\n\n'
+    "Soru:\n"
+    "İş imkânları kısıtlı olduğunda, erkeklerin kadınlara kıyasla işe alınmada daha fazla "
+    "hakka sahip olduğunu düşünür müsün?\n"
+    "  1 = Kesinlikle katılıyorum\n"
+    "  2 = Katılıyorum\n"
+    "  3 = Ne katılıyorum ne katılmıyorum\n"
+    "  4 = Katılmıyorum\n"
+    "  5 = Kesinlikle katılmıyorum"
+)
+
+# ─── Prompt temizleme ─────────────────────────────────────────────────────────
+#
+# Kaldırılan bilgiler:
+#   - "geleneksel cinsiyet rolleri" içeren cümleler  (~1680 persona)
+#   - "evin reisi erkek" / "erkek rol" içeren cümleler
+#   - Doğrudan kadının çalışmasına atıfta bulunan cümleler
+#
+# Strateji: womenwork tutumunu ele veren cümleleri tamamen kaldır.
+
+# Cinsiyet rolü / evin reisi cümleleri
+_SENT_GENDER_ROLE = re.compile(
+    r'[^.;!?\n]*(?:geleneksel\s+cinsiyet\s+rol'
+    r'|evin\s+reis'
+    r'|erkek\s+rol[üu]'
+    r'|kad[iı]n[- ]erkek\s+rol'
+    r'|erkeğ\w*\s+söz\s+sahibi'
+    r'|aile\s+reisi\s+erkek)[^.;!?\n]*[.;!?]?',
+    re.IGNORECASE,
+)
+
+# Doğrudan kadın çalışması ifadeleri
+_SENT_WOMEN_WORK = re.compile(
+    r'[^.;!?\n]*(?:kad[iı]nlar[iı]n?\s+çalış'
+    r'|çalışan\s+kad[iı]n'
+    r'|kad[iı]n.*ev\s+d[iı]ş[iı]nda\s+çalış'
+    r'|işsizlik.*erkek.*öncelik'
+    r'|erkek.*iş.*öncelik)[^.;!?\n]*[.;!?]?',
+    re.IGNORECASE,
+)
+
+_DOUBLE_SPACE = re.compile(r'  +')
+
+
+def clean_prompt(prompt: str) -> str:
+    cleaned = _SENT_GENDER_ROLE.sub('', prompt)
+    cleaned = _SENT_WOMEN_WORK.sub('', cleaned)
+    cleaned = _DOUBLE_SPACE.sub(' ', cleaned)
+    lines = [l.strip() for l in cleaned.splitlines()]
+    return '\n'.join(l for l in lines if l)
+
+
+# ─── API ─────────────────────────────────────────────────────────────────────
+
+def get_client() -> OpenAI:
+    key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
+    if not key:
+        raise ValueError("API anahtarı bulunamadı.")
+    return OpenAI(api_key=key)
+
+
+def parse_response(text: str) -> int | None:
+    if not text:
+        return None
+    valid = (1, 2, 3, 4, 5)
+    for src in [text.strip(),
+                (re.search(r'\{[^{}]*\}', text, re.DOTALL) or type('', (), {'group': lambda s, x: ''})()).group(0)]:
+        try:
+            obj = json.loads(src)
+            val = obj.get("womenwork")
+            if val in valid:
+                return int(val)
+            if str(val) in {str(v) for v in valid}:
+                return int(val)
+        except Exception:
+            pass
+    m = re.search(r'"womenwork"\s*:\s*([12345])', text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def call_api(client: OpenAI, system_prompt: str) -> tuple[int | None, str, int, int]:
+    full_system = f"{TURKEY_CONTEXT.strip()}\n\n{system_prompt}"
+    for attempt in range(1, RETRY_LIMIT + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": full_system},
+                    {"role": "user",   "content": QUESTION},
+                ],
+                temperature=TEMPERATURE,
+                max_completion_tokens=MAX_TOKENS,
+            )
+            raw   = resp.choices[0].message.content or ""
+            tok_p = getattr(resp.usage, "prompt_tokens",     0)
+            tok_c = getattr(resp.usage, "completion_tokens", 0)
+            return parse_response(raw), raw, tok_p, tok_c
+        except Exception as exc:
+            tqdm.write(f"  [Hata] deneme {attempt}/{RETRY_LIMIT}: {exc}")
+            if attempt < RETRY_LIMIT:
+                time.sleep(RETRY_DELAY * attempt)
+    return None, "API_ERROR", 0, 0
+
+
+# ─── Ana akış ────────────────────────────────────────────────────────────────
+
+def load_personas() -> list[dict]:
+    with open(PERSONAS_PATH, encoding="utf-8") as f:
+        data = json.load(f)
+    return [p for p in data if "womenwork" in p.get("ground_truth", {})]
+
+
+def run(checkpoint_path: Path | None = None):
+    personas = load_personas()
+    print(f"womenwork olan persona sayısı: {len(personas)}")
+
+    done: dict[str, dict] = {}
+    if checkpoint_path and checkpoint_path.exists():
+        with open(checkpoint_path, encoding="utf-8") as f:
+            for rec in json.load(f):
+                done[rec["persona_id"]] = rec
+        print(f"Checkpoint yüklendi: {len(done)} persona atlanıyor.")
+
+    client   = get_client()
+    results: list[dict] = list(done.values())
+    remaining = [p for p in personas if p["persona_id"] not in done]
+    total     = len(personas)
+    lock      = threading.Lock()
+    completed_count = len(done)
+
+    print(f"İşlenecek: {len(remaining)} persona | workers: {MAX_WORKERS}\n")
+
+    def process(persona: dict) -> dict:
+        pid    = persona["persona_id"]
+        gt_val = persona["ground_truth"].get("womenwork")
+        cleaned_prompt = clean_prompt(persona.get("system_prompt", ""))
+        pred, raw, tok_p, tok_c = call_api(client, cleaned_prompt)
+        return {
+            "persona_id":       pid,
+            "qform":            persona.get("qform"),
+            "age":              persona.get("age"),
+            "gender":           persona.get("gender"),
+            "region":           persona.get("region"),
+            "womenwork":        gt_val,
+            "gt_womenwork":     gt_val,
+            "pred_womenwork":   pred,
+            "match":            int(pred == gt_val) if pred is not None and gt_val is not None else None,
+            "raw_response":     raw,
+            "token_prompt":     tok_p,
+            "token_completion": tok_c,
+        }
+
+    pbar = tqdm(total=len(remaining), desc="Tahmin", unit="persona")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process, p): p for p in remaining}
+        for future in as_completed(futures):
+            rec = future.result()
+            match_sym = "✓" if rec["match"] == 1 else ("✗" if rec["match"] == 0 else "?")
+            pbar.set_postfix({"id": rec["persona_id"], "gt": rec["gt_womenwork"],
+                              "pred": rec["pred_womenwork"], "match": match_sym})
+            pbar.update(1)
+
+            with lock:
+                results.append(rec)
+                completed_count += 1
+                if checkpoint_path and completed_count % 50 == 0:
+                    with open(checkpoint_path, "w", encoding="utf-8") as f:
+                        json.dump(results, f, ensure_ascii=False, indent=2)
+                    tqdm.write(f"  → Checkpoint kaydedildi ({completed_count}/{total})")
+
+    pbar.close()
+
+    if checkpoint_path:
+        with open(checkpoint_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+
+    return results
+
+
+# ─── Kayıt ───────────────────────────────────────────────────────────────────
+
+def save_results(results: list[dict], ts: str):
+    csv_path  = EXPORTS_DIR / f"womenwork_predictions_{ts}.csv"
+    json_path = EXPORTS_DIR / f"womenwork_predictions_{ts}.json"
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    if results:
+        headers = list(results[0].keys())
+        with open(csv_path, "w", encoding="utf-8-sig") as f:
+            f.write(",".join(headers) + "\n")
+            for rec in results:
+                row = []
+                for h in headers:
+                    val = rec.get(h, "")
+                    s = "" if val is None else str(val)
+                    if "," in s or '"' in s or "\n" in s:
+                        s = '"' + s.replace('"', '""') + '"'
+                    row.append(s)
+                f.write(",".join(row) + "\n")
+
+    return csv_path, json_path
+
+
+# ─── Özet ────────────────────────────────────────────────────────────────────
+
+def print_summary(results: list[dict]):
+    from collections import Counter
+
+    valid      = [r for r in results if r["match"] is not None]
+    parse_fail = sum(1 for r in results if r["pred_womenwork"] is None)
+    if not valid:
+        print("Geçerli sonuç yok.")
+        return
+
+    gt_vals   = [r["gt_womenwork"]   for r in valid]
+    pred_vals = [r["pred_womenwork"] for r in valid]
+    accuracy  = sum(r["match"] for r in valid) / len(valid)
+    labels    = sorted(set(gt_vals) | set(pred_vals))
+    label_names = {
+        1: "Ksnkl Katıl (1)",
+        2: "Katılıyorum (2)",
+        3: "Nötr       (3)",
+        4: "Katılmıyor (4)",
+        5: "Ksnkl Katılm(5)",
+    }
+
+    cm: dict[tuple, int] = {}
+    for g, p in zip(gt_vals, pred_vals):
+        cm[(g, p)] = cm.get((g, p), 0) + 1
+
+    metrics = {}
+    for lbl in labels:
+        tp = cm.get((lbl, lbl), 0)
+        fp = sum(cm.get((g, lbl), 0) for g in labels if g != lbl)
+        fn = sum(cm.get((lbl, p), 0) for p in labels if p != lbl)
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        metrics[lbl] = {"precision": prec, "recall": rec, "f1": f1}
+
+    col_w = 18
+    print("\n" + "=" * 72)
+    print("ÖZET")
+    print("=" * 72)
+    print(f"Toplam      : {len(results)}")
+    print(f"Geçerli     : {len(valid)}")
+    print(f"Parse hata  : {parse_fail}")
+    print(f"Accuracy    : {accuracy:.4f}  ({sum(r['match'] for r in valid)}/{len(valid)})")
+    print(f"\nGT dağılımı  : {dict(Counter(gt_vals))}")
+    print(f"Pred dağılımı: {dict(Counter(pred_vals))}")
+
+    print("\n── Confusion Matrix ─────────────────────────────────────────────")
+    header = " " * 18 + "".join(f"{'Pred '+str(l):>{col_w}}" for l in labels)
+    print(header)
+    print(" " * 18 + "-" * (col_w * len(labels)))
+    for g in labels:
+        row = f"GT {label_names.get(g, str(g)):<15}"
+        for p in labels:
+            row += f"{cm.get((g, p), 0):>{col_w}}"
+        print(row)
+
+    print("\n── Per-class Metrics ────────────────────────────────────────────")
+    print(f"{'Sınıf':<18} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Support':>10}")
+    print("-" * 60)
+    for lbl in labels:
+        support = sum(1 for g in gt_vals if g == lbl)
+        m = metrics[lbl]
+        print(f"{label_names.get(lbl, str(lbl)):<18} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1']:>10.4f} {support:>10}")
+
+    n = len(valid)
+    macro_p  = sum(metrics[l]["precision"] for l in labels) / len(labels)
+    macro_r  = sum(metrics[l]["recall"]    for l in labels) / len(labels)
+    macro_f1 = sum(metrics[l]["f1"]        for l in labels) / len(labels)
+    w_p  = sum(metrics[l]["precision"] * sum(1 for g in gt_vals if g == l) for l in labels) / n
+    w_r  = sum(metrics[l]["recall"]    * sum(1 for g in gt_vals if g == l) for l in labels) / n
+    w_f1 = sum(metrics[l]["f1"]        * sum(1 for g in gt_vals if g == l) for l in labels) / n
+    print("-" * 60)
+    print(f"{'Macro avg':<18} {macro_p:>10.4f} {macro_r:>10.4f} {macro_f1:>10.4f} {n:>10}")
+    print(f"{'Weighted avg':<18} {w_p:>10.4f} {w_r:>10.4f} {w_f1:>10.4f} {n:>10}")
+    print("=" * 72)
+
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    ts              = datetime.now().strftime("%Y%m%d_%H%M%S")
+    checkpoint_path = EXPORTS_DIR / "womenwork_checkpoint.json"
+
+    print(f"Model: {MODEL} | Temperature: {TEMPERATURE}")
+    print(f"Checkpoint: {checkpoint_path}\n")
+
+    # Prompt temizleme önizlemesi
+    print("── Prompt temizleme testi ──")
+    _leak_kw = re.compile(
+        r'geleneksel\s+cinsiyet\s+rol'
+        r'|evin\s+reis'
+        r'|erkek\s+rol[üu]'
+        r'|kad[iı]n[- ]erkek\s+rol'
+        r'|erkeğ\w*\s+söz\s+sahibi'
+        r'|aile\s+reisi\s+erkek'
+        r'|kad[iı]nlar[iı]n?\s+çalış'
+        r'|erkek.*iş.*öncelik',
+        re.IGNORECASE,
+    )
+    with open(PERSONAS_PATH, encoding="utf-8") as f:
+        _sample_data = json.load(f)
+    _ww = [p for p in _sample_data if "womenwork" in p.get("ground_truth", {})]
+    _leaky = [p for p in _ww if _leak_kw.search(p.get("system_prompt", ""))]
+    _still = [p for p in _leaky if _leak_kw.search(clean_prompt(p.get("system_prompt", "")))]
+    print(f"  Leak içeren prompt: {len(_leaky)}/{len(_ww)} → temizleme sonrası kalan: {len(_still)}")
+    if _leaky:
+        _ex = _leaky[0]
+        for _s in re.split(r'(?<=[.;])\s+', _ex["system_prompt"]):
+            if _leak_kw.search(_s):
+                print(f"  KALDIRILDI: {repr(_s.strip()[:120])}")
+    print()
+
+    results = run(checkpoint_path=checkpoint_path)
+
+    csv_path, json_path = save_results(results, ts)
+    print(f"\nCSV  → {csv_path}")
+    print(f"JSON → {json_path}")
+
+    print_summary(results)
+
+    if checkpoint_path.exists():
+        checkpoint_path.unlink()
+        print("Checkpoint temizlendi.")

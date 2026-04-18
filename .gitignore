@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Exports (large CSV/JSON outputs)
+exports/
+
+# Backup files
+*_backup_*.json
+personas_rewritten_v2_old.json
+personas_rewritten.json
+personas_v2.json
+personas.json
+personas_backup_*.json
+
+# Databases
+*.db
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
+
+# Office docs
+*.docx
+*.xlsx
+
+# Old script versions
+*_v1.py
+*_v2.py
+agentrewrite.py
+deneme.py
+experiment_gradio_app.py
+gradio_app.py
+gradio_app_v2.py
+01_persona_engine.py
+01_persona_engine_v1.py
+01_persona_engine_v2.py
+02_rewrite_engine.py
+02_rewrite_engine_v1.py
+02_rewrite_engine_v2.py
+
+# Misc
+hf_space/
+hf_space_exp/
+TGSS/
+results_cache*.db
+pacdemons_evet_personalar.txt
+errors.log
