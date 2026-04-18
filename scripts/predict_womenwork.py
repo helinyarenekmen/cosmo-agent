@@ -46,18 +46,17 @@ TURKEY_CONTEXT = (
 )
 
 QUESTION = (
-    "Aşağıdaki soru kadınların çalışma hayatına ilişkin bir tutum sorusudur. "
+    "Aşağıdaki soru toplumsal cinsiyet rollerine ilişkin bir tutum sorusudur. "
     "Kendi gerçek değerlerine ve bakış açına göre dürüstçe yanıtla.\n\n"
     "Yanıtını SADECE şu JSON formatında ver, başka hiçbir şey yazma:\n"
     '{"womenwork": <1, 2, 3, 4 veya 5>}\n\n'
     "Soru:\n"
-    "İş imkânları kısıtlı olduğunda, erkeklerin kadınlara kıyasla işe alınmada daha fazla "
-    "hakka sahip olduğunu düşünür müsün?\n"
-    "  1 = Kesinlikle katılıyorum\n"
-    "  2 = Katılıyorum\n"
+    "Bir erkeğin görevi para kazanmaktır; bir kadının görevi ise eve ve aileye bakmaktır.\n"
+    "  1 = Hiç katılmıyorum\n"
+    "  2 = Katılmıyorum\n"
     "  3 = Ne katılıyorum ne katılmıyorum\n"
-    "  4 = Katılmıyorum\n"
-    "  5 = Kesinlikle katılmıyorum"
+    "  4 = Katılıyorum\n"
+    "  5 = Tamamen katılıyorum"
 )
 
 # ─── Prompt temizleme ─────────────────────────────────────────────────────────
@@ -273,11 +272,11 @@ def print_summary(results: list[dict]):
     accuracy  = sum(r["match"] for r in valid) / len(valid)
     labels    = sorted(set(gt_vals) | set(pred_vals))
     label_names = {
-        1: "Ksnkl Katıl (1)",
-        2: "Katılıyorum (2)",
+        1: "Hiç Katılm. (1)",
+        2: "Katılmıyor (2)",
         3: "Nötr       (3)",
-        4: "Katılmıyor (4)",
-        5: "Ksnkl Katılm(5)",
+        4: "Katılıyorum (4)",
+        5: "Tmnkl Katıl(5)",
     }
 
     cm: dict[tuple, int] = {}
