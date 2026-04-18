@@ -24,8 +24,7 @@ LABEL_MAP = {
     4: "Agree (4)",             5: "Strongly agree (5)",
 }
 LABEL_SHORT = {1: "SD(1)", 2: "D(2)", 3: "N(3)", 4: "A(4)", 5: "SA(5)"}
-COLORS = {"gt": "#4C72B0", "sampled": "#DD8452", "argmax": "#55A868",
-          "match": "#55A868", "no_match": "#C44E52"}
+COLORS = {"gt": "#4C72B0", "sampled": "#DD8452", "match": "#55A868", "no_match": "#C44E52"}
 
 PLOTS_DIR: Path = None
 
@@ -41,8 +40,7 @@ def load_latest_csv() -> Path:
 
 def load_data(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
-    for col in ["gt_womenwork", "sampled_pred", "argmax_pred",
-                "match_sampled", "match_argmax",
+    for col in ["gt_womenwork", "sampled_pred", "match_sampled",
                 "p1", "p2", "p3", "p4", "p5", "age"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -51,11 +49,11 @@ def load_data(csv_path: Path) -> pd.DataFrame:
 
 # ─── Metrics ─────────────────────────────────────────────────────────────────
 
-def compute_metrics(df: pd.DataFrame, pred_col: str, match_col: str) -> dict:
-    valid  = df.dropna(subset=["gt_womenwork", pred_col, match_col])
-    labels = sorted(set(valid["gt_womenwork"].astype(int)) | set(valid[pred_col].astype(int)))
+def compute_metrics(df: pd.DataFrame) -> dict:
+    valid  = df.dropna(subset=["gt_womenwork", "sampled_pred", "match_sampled"])
+    labels = sorted(set(valid["gt_womenwork"].astype(int)) | set(valid["sampled_pred"].astype(int)))
     gt     = valid["gt_womenwork"].astype(int).tolist()
-    pred   = valid[pred_col].astype(int).tolist()
+    pred   = valid["sampled_pred"].astype(int).tolist()
 
     cm = {(g, p): sum(1 for a, b in zip(gt, pred) if a == g and b == p)
           for g in labels for p in labels}
@@ -72,13 +70,13 @@ def compute_metrics(df: pd.DataFrame, pred_col: str, match_col: str) -> dict:
                           "support": sum(1 for g in gt if g == lbl)}
 
     n        = len(valid)
-    acc      = valid[match_col].sum() / n if n else 0.0
+    acc      = valid["match_sampled"].sum() / n if n else 0.0
     macro_f1 = sum(per_class[l]["f1"] for l in labels) / len(labels)
     w_f1     = sum(per_class[l]["f1"] * per_class[l]["support"] for l in labels) / n if n else 0.0
 
     return {
         "total": len(df), "valid": n,
-        "parse_fail": int(df[pred_col].isna().sum()),
+        "parse_fail": int(df["sampled_pred"].isna().sum()),
         "accuracy": acc, "macro_f1": macro_f1, "weighted_f1": w_f1,
         "cm": cm, "per_class": per_class, "labels": labels,
         "gt_dist":   dict(Counter(gt)),
@@ -101,7 +99,7 @@ def img_tag(rel_path: str, alt: str = "") -> str:
 
 # ─── Plots ───────────────────────────────────────────────────────────────────
 
-def plot_confusion_matrix(metrics: dict, title: str, fname: str) -> str:
+def plot_confusion_matrix(metrics: dict) -> str:
     labels = metrics["labels"]
     cm     = metrics["cm"]
     matrix = np.array([[cm.get((g, p), 0) for p in labels] for g in labels])
@@ -115,7 +113,7 @@ def plot_confusion_matrix(metrics: dict, title: str, fname: str) -> str:
     ax.set_xticklabels(tick_labels, fontsize=10)
     ax.set_yticklabels(tick_labels, fontsize=10)
     ax.set_xlabel("Predicted", fontsize=11); ax.set_ylabel("Ground Truth", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_title("Confusion Matrix", fontsize=13, fontweight="bold")
     for i in range(len(labels)):
         for j in range(len(labels)):
             val   = matrix[i, j]
@@ -123,10 +121,10 @@ def plot_confusion_matrix(metrics: dict, title: str, fname: str) -> str:
             ax.text(j, i, f"{val}\n({val/total*100:.1f}%)",
                     ha="center", va="center", fontsize=8, color=color, fontweight="bold")
     plt.tight_layout()
-    return save_fig(fig, fname)
+    return save_fig(fig, "confusion_matrix.png")
 
 
-def plot_confusion_normalised(metrics: dict, title: str, fname: str) -> str:
+def plot_confusion_normalised(metrics: dict) -> str:
     labels = metrics["labels"]
     cm     = metrics["cm"]
     matrix = np.array([[cm.get((g, p), 0) for p in labels] for g in labels], dtype=float)
@@ -141,30 +139,28 @@ def plot_confusion_normalised(metrics: dict, title: str, fname: str) -> str:
     ax.set_xticklabels(tick_labels, fontsize=10)
     ax.set_yticklabels(tick_labels, fontsize=10)
     ax.set_xlabel("Predicted", fontsize=11); ax.set_ylabel("Ground Truth", fontsize=11)
-    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_title("Normalised Confusion Matrix\n(row = GT class)", fontsize=12, fontweight="bold")
     for i in range(len(labels)):
         for j in range(len(labels)):
             ax.text(j, i, f"{norm[i,j]:.2f}", ha="center", va="center", fontsize=10,
                     color="white" if norm[i, j] > 0.6 else "black", fontweight="bold")
     plt.tight_layout()
-    return save_fig(fig, fname)
+    return save_fig(fig, "confusion_matrix_normalised.png")
 
 
-def plot_distribution(df: pd.DataFrame, m_smp: dict, m_arg: dict) -> str:
-    labels = m_smp["labels"]
-    x, w = np.arange(len(labels)), 0.25
+def plot_distribution(metrics: dict) -> str:
+    labels = metrics["labels"]
+    x, w = np.arange(len(labels)), 0.35
 
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.bar(x - w,  [m_smp["gt_dist"].get(l, 0)   for l in labels], w,
+    ax.bar(x - w/2, [metrics["gt_dist"].get(l, 0)   for l in labels], w,
            label="Ground Truth", color=COLORS["gt"],      alpha=0.85)
-    ax.bar(x,      [m_smp["pred_dist"].get(l, 0)  for l in labels], w,
+    ax.bar(x + w/2, [metrics["pred_dist"].get(l, 0) for l in labels], w,
            label="Sampled",      color=COLORS["sampled"], alpha=0.85)
-    ax.bar(x + w,  [m_arg["pred_dist"].get(l, 0)  for l in labels], w,
-           label="Argmax",       color=COLORS["argmax"],  alpha=0.85)
     ax.set_xticks(x)
     ax.set_xticklabels([LABEL_MAP[l] for l in labels], fontsize=8)
     ax.set_ylabel("Count", fontsize=11)
-    ax.set_title("Ground Truth vs Sampled vs Argmax Distribution", fontsize=13, fontweight="bold")
+    ax.set_title("Ground Truth vs Sampled Distribution", fontsize=13, fontweight="bold")
     ax.legend(fontsize=10)
     ax.yaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     plt.tight_layout()
@@ -218,11 +214,10 @@ def plot_entropy(df: pd.DataFrame) -> str:
     return save_fig(fig, "entropy.png")
 
 
-def plot_accuracy_by_group(df: pd.DataFrame, col: str, match_col: str,
-                           title: str, fname: str) -> str:
-    valid  = df.dropna(subset=[match_col, col]).copy()
+def plot_accuracy_by_group(df: pd.DataFrame, col: str, title: str, fname: str) -> str:
+    valid  = df.dropna(subset=["match_sampled", col]).copy()
     valid[col] = valid[col].astype(str)
-    groups = (valid.groupby(col)[match_col]
+    groups = (valid.groupby(col)["match_sampled"]
               .agg(["mean", "count"])
               .reset_index()
               .rename(columns={"mean": "accuracy", "count": "n"})
@@ -244,12 +239,12 @@ def plot_accuracy_by_group(df: pd.DataFrame, col: str, match_col: str,
     return save_fig(fig, fname)
 
 
-def plot_accuracy_by_age(df: pd.DataFrame, match_col: str, fname: str) -> str:
-    valid = df.dropna(subset=[match_col, "age"]).copy()
+def plot_accuracy_by_age(df: pd.DataFrame) -> str:
+    valid = df.dropna(subset=["match_sampled", "age"]).copy()
     bins       = [18, 25, 35, 45, 55, 65, 100]
     age_labels = ["18-24", "25-34", "35-44", "45-54", "55-64", "65+"]
     valid["age_group"] = pd.cut(valid["age"], bins=bins, labels=age_labels, right=False)
-    groups = valid.groupby("age_group", observed=True)[match_col].agg(["mean", "count"]).reset_index()
+    groups = valid.groupby("age_group", observed=True)["match_sampled"].agg(["mean", "count"]).reset_index()
 
     fig, ax = plt.subplots(figsize=(7, 4))
     colors = [COLORS["match"] if v >= 0.35 else COLORS["no_match"] if v < 0.20 else "#F0A500"
@@ -261,90 +256,71 @@ def plot_accuracy_by_age(df: pd.DataFrame, match_col: str, fname: str) -> str:
                 ha="center", va="bottom", fontsize=9)
     ax.set_ylim(0, 1.15)
     ax.set_xlabel("Age Group", fontsize=11); ax.set_ylabel("Accuracy", fontsize=11)
-    ax.set_title("Accuracy by Age Group (Argmax)", fontsize=13, fontweight="bold")
-    ax.axhline(valid[match_col].mean(), color="gray", linestyle="--", linewidth=1, label="Overall mean")
+    ax.set_title("Accuracy by Age Group", fontsize=13, fontweight="bold")
+    ax.axhline(valid["match_sampled"].mean(), color="gray", linestyle="--", linewidth=1, label="Overall mean")
     ax.legend(fontsize=9)
     plt.tight_layout()
-    return save_fig(fig, fname)
+    return save_fig(fig, "accuracy_by_age.png")
 
 
 # ─── Report ──────────────────────────────────────────────────────────────────
 
-def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
-                 csv_path: Path, ts: str) -> str:
+def build_report(df: pd.DataFrame, metrics: dict, csv_path: Path, ts: str) -> str:
+    m, pc, labels = metrics, metrics["per_class"], metrics["labels"]
 
-    print("  confusion matrix (sampled)...")
-    p_cm_smp   = plot_confusion_matrix(m_smp, "Confusion Matrix — Sampled",
-                                       "confusion_matrix_sampled.png")
-    print("  confusion matrix (argmax)...")
-    p_cm_arg   = plot_confusion_matrix(m_arg, "Confusion Matrix — Argmax",
-                                       "confusion_matrix_argmax.png")
-    print("  normalised (sampled)...")
-    p_norm_smp = plot_confusion_normalised(m_smp,
-                                           "Normalised Confusion Matrix — Sampled",
-                                           "confusion_matrix_normalised_sampled.png")
-    print("  normalised (argmax)...")
-    p_norm_arg = plot_confusion_normalised(m_arg,
-                                           "Normalised Confusion Matrix — Argmax",
-                                           "confusion_matrix_normalised_argmax.png")
+    print("  confusion matrix...")
+    p_cm      = plot_confusion_matrix(metrics)
+    print("  normalised confusion matrix...")
+    p_norm    = plot_confusion_normalised(metrics)
     print("  distribution...")
-    p_dist     = plot_distribution(df, m_smp, m_arg)
+    p_dist    = plot_distribution(metrics)
     print("  mean probs by GT...")
-    p_probs    = plot_mean_probs_by_gt(df)
+    p_probs   = plot_mean_probs_by_gt(df)
     print("  entropy...")
-    p_entropy  = plot_entropy(df)
+    p_entropy = plot_entropy(df)
     print("  accuracy by region...")
-    p_region   = plot_accuracy_by_group(df, "region", "match_argmax",
-                                        "Accuracy by Region (Argmax)", "accuracy_by_region.png")
+    p_region  = plot_accuracy_by_group(df, "region", "Accuracy by Region", "accuracy_by_region.png")
     print("  accuracy by gender...")
-    p_gender   = plot_accuracy_by_group(df, "gender", "match_argmax",
-                                        "Accuracy by Gender (Argmax)", "accuracy_by_gender.png")
+    p_gender  = plot_accuracy_by_group(df, "gender", "Accuracy by Gender", "accuracy_by_gender.png")
     print("  accuracy by age...")
-    p_age      = plot_accuracy_by_age(df, "match_argmax", "accuracy_by_age.png")
+    p_age     = plot_accuracy_by_age(df)
 
-    def _cm_table(m: dict) -> str:
-        labels = m["labels"]
-        header = "| | " + " | ".join(f"**Pred {LABEL_SHORT[l]}**" for l in labels) + " |"
-        sep    = "|---|" + "|".join("---" for _ in labels) + "|"
-        rows   = "\n".join(
-            "| **GT " + LABEL_SHORT[g] + "** | " +
-            " | ".join(str(m["cm"].get((g, p), 0)) for p in labels) + " |"
-            for g in labels
-        )
-        return f"{header}\n{sep}\n{rows}"
+    cm_header = "| | " + " | ".join(f"**Pred {LABEL_SHORT[l]}**" for l in labels) + " |"
+    cm_sep    = "|---|" + "|".join("---" for _ in labels) + "|"
+    cm_rows   = "\n".join(
+        "| **GT " + LABEL_SHORT[g] + "** | " +
+        " | ".join(str(m["cm"].get((g, p), 0)) for p in labels) + " |"
+        for g in labels
+    )
 
-    def _pc_table(m: dict) -> str:
-        labels = m["labels"]
-        pc = m["per_class"]
-        n  = m["valid"]
-        macro_p = sum(pc[l]["precision"] for l in labels) / len(labels)
-        macro_r = sum(pc[l]["recall"]    for l in labels) / len(labels)
-        w_p     = sum(pc[l]["precision"] * pc[l]["support"] for l in labels) / n
-        w_r     = sum(pc[l]["recall"]    * pc[l]["support"] for l in labels) / n
-        rows = "\n".join(
-            f"| {LABEL_MAP[l]} | {pc[l]['support']} | "
-            f"{pc[l]['precision']:.4f} | {pc[l]['recall']:.4f} | {pc[l]['f1']:.4f} |"
-            for l in labels
-        )
-        return (
-            "| Class | Support | Precision | Recall | F1 |\n"
-            "|---|---|---|---|---|\n"
-            f"{rows}\n"
-            f"| **Macro avg** | {n} | {macro_p:.4f} | {macro_r:.4f} | {m['macro_f1']:.4f} |\n"
-            f"| **Weighted avg** | {n} | {w_p:.4f} | {w_r:.4f} | {m['weighted_f1']:.4f} |"
-        )
+    n       = m["valid"]
+    macro_p = sum(pc[l]["precision"] for l in labels) / len(labels)
+    macro_r = sum(pc[l]["recall"]    for l in labels) / len(labels)
+    w_p     = sum(pc[l]["precision"] * pc[l]["support"] for l in labels) / n
+    w_r     = sum(pc[l]["recall"]    * pc[l]["support"] for l in labels) / n
+    pc_rows = "\n".join(
+        f"| {LABEL_MAP[l]} | {pc[l]['support']} | "
+        f"{pc[l]['precision']:.4f} | {pc[l]['recall']:.4f} | {pc[l]['f1']:.4f} |"
+        for l in labels
+    )
+
+    dist_rows = "\n".join(
+        f"| {LABEL_MAP[l]} | {m['gt_dist'].get(l,0)} ({m['gt_dist'].get(l,0)/n*100:.1f}%) "
+        f"| {m['pred_dist'].get(l,0)} ({m['pred_dist'].get(l,0)/n*100:.1f}%) |"
+        for l in labels
+    )
 
     region_rows = "\n".join(
         f"| {r['region']} | {int(r['count'])} | {r['mean']:.4f} |"
-        for _, r in (df.dropna(subset=["match_argmax", "region"])
-                     .groupby("region")["match_argmax"]
+        for _, r in (df.dropna(subset=["match_sampled", "region"])
+                     .groupby("region")["match_sampled"]
                      .agg(["mean", "count"]).reset_index()
                      .sort_values("mean", ascending=False)).iterrows()
     )
     gender_rows = "\n".join(
         f"| {r['gender']} | {int(r['count'])} | {r['mean']:.4f} |"
-        for _, r in (df.dropna(subset=["match_argmax", "gender"])
-                     .groupby("gender")["match_argmax"]
+        for _, r in (df.dropna(subset=["match_sampled", "gender"])
+                     .groupby("gender")["match_sampled"]
                      .agg(["mean", "count"]).reset_index()
                      .sort_values("mean", ascending=False)).iterrows()
     )
@@ -364,28 +340,32 @@ def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
 **Prompt cleaning:** sentences revealing gender-role attitudes removed before inference.
 
 > **Verbalized Sampling:** the model outputs a probability distribution (p1–p5) over all classes.
-> **Argmax** = deterministic (highest probability wins). **Sampled** = drawn from the distribution.
+> The final prediction is drawn by sampling from this distribution.
 
 ---
 
 ## 1. Overall Performance
 
-| Metric | Sampled | Argmax |
-|---|---|---|
-| Total personas | {m_smp['total']} | {m_arg['total']} |
-| Valid predictions | {m_smp['valid']} | {m_arg['valid']} |
-| Parse failures | {m_smp['parse_fail']} | {m_arg['parse_fail']} |
-| **Accuracy** | **{m_smp['accuracy']:.4f}** | **{m_arg['accuracy']:.4f}** |
-| Macro F1 | {m_smp['macro_f1']:.4f} | {m_arg['macro_f1']:.4f} |
-| Weighted F1 | {m_smp['weighted_f1']:.4f} | {m_arg['weighted_f1']:.4f} |
+| Metric | Value |
+|---|---|
+| Total personas | {m['total']} |
+| Valid predictions | {m['valid']} |
+| Parse failures | {m['parse_fail']} |
+| **Accuracy** | **{m['accuracy']:.4f}** |
+| Macro F1 | {m['macro_f1']:.4f} |
+| Weighted F1 | {m['weighted_f1']:.4f} |
 
 > 5-class random baseline ≈ 0.20
 
 ---
 
-## 2. Distribution: Ground Truth vs Sampled vs Argmax
+## 2. Ground Truth vs Sampled Distribution
 
 {img_tag(p_dist, "Distribution")}
+
+| Class | Ground Truth | Sampled Prediction |
+|---|---|---|
+{dist_rows}
 
 ---
 
@@ -412,47 +392,35 @@ def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
 
 ---
 
-## 4. Confusion Matrices
+## 4. Confusion Matrix
 
-### 4a. Sampled
+{img_tag(p_cm, "Confusion Matrix")}
 
-{img_tag(p_cm_smp, "Confusion Matrix Sampled")}
-
-{_cm_table(m_smp)}
-
-### 4b. Argmax
-
-{img_tag(p_cm_arg, "Confusion Matrix Argmax")}
-
-{_cm_table(m_arg)}
+{cm_header}
+{cm_sep}
+{cm_rows}
 
 ---
 
-## 5. Normalised Confusion Matrices
+## 5. Normalised Confusion Matrix
 
-### 5a. Sampled
+{img_tag(p_norm, "Normalised Confusion Matrix")}
 
-{img_tag(p_norm_smp, "Normalised Confusion Matrix Sampled")}
-
-### 5b. Argmax
-
-{img_tag(p_norm_arg, "Normalised Confusion Matrix Argmax")}
+> Row-normalised: shows what the model predicts *given* the true class.
 
 ---
 
 ## 6. Per-class Metrics
 
-### 6a. Sampled
-
-{_pc_table(m_smp)}
-
-### 6b. Argmax
-
-{_pc_table(m_arg)}
+| Class | Support | Precision | Recall | F1 |
+|---|---|---|---|---|
+{pc_rows}
+| **Macro avg** | {n} | {macro_p:.4f} | {macro_r:.4f} | {m['macro_f1']:.4f} |
+| **Weighted avg** | {n} | {w_p:.4f} | {w_r:.4f} | {m['weighted_f1']:.4f} |
 
 ---
 
-## 7. Accuracy by Region (Argmax)
+## 7. Accuracy by Region
 
 {img_tag(p_region, "Accuracy by Region")}
 
@@ -462,7 +430,7 @@ def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
 
 ---
 
-## 8. Accuracy by Gender (Argmax)
+## 8. Accuracy by Gender
 
 {img_tag(p_gender, "Accuracy by Gender")}
 
@@ -472,7 +440,7 @@ def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
 
 ---
 
-## 9. Accuracy by Age Group (Argmax)
+## 9. Accuracy by Age Group
 
 {img_tag(p_age, "Accuracy by Age Group")}
 
@@ -480,9 +448,8 @@ def build_report(df: pd.DataFrame, m_smp: dict, m_arg: dict,
 
 ## 10. Notes
 
-- Parse failures: **{m_smp['parse_fail']}** personas (`{m_smp['parse_fail']/m_smp['total']*100:.1f}%`).
+- Parse failures: **{m['parse_fail']}** personas (`{m['parse_fail']/m['total']*100:.1f}%`).
 - Mean entropy {ent.mean():.3f} bits out of max 2.322 — model is {'fairly confident' if ent.mean() < 1.5 else 'quite uncertain'} on average.
-- Argmax accuracy ({m_arg['accuracy']:.4f}) vs direct prediction baseline for comparison.
 """
 
 
@@ -492,9 +459,8 @@ def main():
     csv_path = Path(sys.argv[1]) if len(sys.argv) > 1 else load_latest_csv()
     print(f"Source: {csv_path}")
 
-    df    = load_data(csv_path)
-    m_smp = compute_metrics(df, "sampled_pred", "match_sampled")
-    m_arg = compute_metrics(df, "argmax_pred",  "match_argmax")
+    df      = load_data(csv_path)
+    metrics = compute_metrics(df)
     ts      = datetime.now().strftime("%Y-%m-%d %H:%M")
     ts_file = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -504,15 +470,14 @@ def main():
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
     print("Generating plots...")
-    report = build_report(df, m_smp, m_arg, csv_path, ts)
+    report = build_report(df, metrics, csv_path, ts)
 
     report_path = REPORTS_DIR / f"womenwork_verbsampling_report_{ts_file}.md"
     report_path.write_text(report, encoding="utf-8")
 
     print(f"\nReport → {report_path}")
     print(f"Plots  → {PLOTS_DIR}/")
-    print(f"Sampled — Accuracy: {m_smp['accuracy']:.4f} | Macro F1: {m_smp['macro_f1']:.4f}")
-    print(f"Argmax  — Accuracy: {m_arg['accuracy']:.4f} | Macro F1: {m_arg['macro_f1']:.4f}")
+    print(f"Accuracy: {metrics['accuracy']:.4f} | Macro F1: {metrics['macro_f1']:.4f}")
 
 
 if __name__ == "__main__":
